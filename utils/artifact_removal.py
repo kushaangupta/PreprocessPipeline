@@ -16,10 +16,11 @@ def detect_high_amplitude_artifacts(
     seed: int = 0,                     # RNG seed for reproducible window sampling
     chunk_s: float = 5.0,              # Chunk duration (s) for scanning the full recording
     dead_time_ms: float = 50.0,       # Refractory (ms) to merge nearby triggers from the same group
-    n_jobs: int = -1                   # Number of parallel workers for chunk scanning (joblib semantics)
+    n_jobs: int = -1,                  # Number of parallel workers for chunk scanning (joblib semantics)
+    return_epochs: bool = False        # If True, return [start, end] epochs instead of trigger frames
 ):
     """
-    Detect large-amplitude movement/lick artifacts and return trigger frames per group.
+    Detect large-amplitude movement/lick artifacts and return trigger frames or epochs per group.
     All steps (threshold estimation, worker definition, parallel scanning, aggregation) are
     performed inside this single function.
 
@@ -44,11 +45,15 @@ def detect_high_amplitude_artifacts(
         Refractory period (ms) to merge multiple detection triggers into one.
     n_jobs : int, default -1
         Number of parallel jobs (joblib). Use backend="threading" internally.
+    return_epochs : bool, default False
+        If True, return epochs as [[start_frame, end_frame], ...] for each group.
+        If False, return single trigger frames (peak detection points).
 
     Returns
     -------
     final_triggers : dict
-        Mapping {group_id: [frame_indices]}.
+        If return_epochs=False: Mapping {group_id: [frame_indices]}.
+        If return_epochs=True: Mapping {group_id: [[start, end], ...]}.
     """
     
     def _worker_scan_chunk_inner(start_frame, end_frame, thresholds_dict, group_to_inds):
@@ -172,17 +177,41 @@ def detect_high_amplitude_artifacts(
         candidates = np.concatenate(all_candidates[gid])
         candidates.sort()
         
-        # Enforce dead time on a per-group basis
-        filtered = []
-        last_trig = -dead_time_samp * 2
+        if return_epochs:
+            # Convert consecutive frames into epochs [start, end]
+            epochs = []
+            if len(candidates) > 0:
+                epoch_start = candidates[0]
+                epoch_end = candidates[0]
+                
+                for i in range(1, len(candidates)):
+                    # If within dead_time, extend current epoch
+                    if candidates[i] - epoch_end <= dead_time_samp:
+                        epoch_end = candidates[i]
+                    else:
+                        # Save current epoch and start a new one
+                        epochs.append([int(epoch_start), int(epoch_end)])
+                        epoch_start = candidates[i]
+                        epoch_end = candidates[i]
+                
+                # Don't forget the last epoch
+                epochs.append([int(epoch_start), int(epoch_end)])
+            
+            final_triggers[gid] = epochs
+            n_art = len(epochs)
+        else:
+            # Original behavior: merge nearby triggers, keep single frame per event
+            filtered = []
+            last_trig = -dead_time_samp * 2
 
-        for t in candidates:
-            if t - last_trig > dead_time_samp:
-                filtered.append(int(t))
-                last_trig = t
+            for t in candidates:
+                if t - last_trig > dead_time_samp:
+                    filtered.append(int(t))
+                    last_trig = t
+            
+            final_triggers[gid] = filtered
+            n_art = len(filtered)
         
-        final_triggers[gid] = filtered
-        n_art = len(filtered)
         total_artifacts += n_art
         print(f"  Group {gid}: {n_art} artifacts detected")
 
@@ -192,11 +221,12 @@ def detect_high_amplitude_artifacts(
 
 def remove_artifacts(
     recording_in: si.BaseRecording,
-    artifact_per_group: dict[int, list[int]] or list[int],
+    artifact_per_group: dict[int, list[int]] or list[int] or dict[int, list[list[int]]],
     by_group: bool = True,         # If False, treat all channels as a single group
     ms_before: float = 0.5,        # Window start relative to trigger (ms; positive values look back in time)
     ms_after: float = 3.0,         # Window end relative to trigger (ms; positive values look forward in time)
     mode: str = "cubic",           # Interpolation strategy: 'cubic' | 'linear' | 'mean' (SI >= 0.98)
+    use_epochs: bool = False,      # If True, interpret input as epochs [[start, end], ...]
 ):
     """
     Apply `spre.remove_artifacts` independently per group (or globally), then stitch channels back together.
@@ -205,17 +235,21 @@ def remove_artifacts(
     ----------
     recording_in : si.BaseRecording
         Single-segment input recording extractor.
-    artifact_per_group : dict[int, list[int]]
-        Mapping group_id -> list of trigger frames (global timeline) to remove.
+    artifact_per_group : dict[int, list[int]] or list[int] or dict[int, list[list[int]]]
+        If use_epochs=False: Mapping group_id -> list of trigger frames (global timeline) to remove.
+        If use_epochs=True: Mapping group_id -> list of [start, end] epoch pairs.
     by_group : bool, default True
         If True, apply removal independently for each group.
         If False, apply removal to all channels simultaneously using triggers from key 0.
     ms_before : float, default 0.5
-        Duration (ms) before trigger to remove.
+        Duration (ms) before trigger to remove (ignored if use_epochs=True).
     ms_after : float, default 3.0
-        Duration (ms) after trigger to remove.
+        Duration (ms) after trigger to remove (ignored if use_epochs=True).
     mode : str, default 'cubic'
         SI strategy for trace interpolation ('cubic', 'linear', or 'mean').
+    use_epochs : bool, default False
+        If True, treat artifact_per_group as epochs [[start, end], ...] instead of trigger frames.
+        Each epoch will be removed in its entirety.
 
     Returns
     -------
@@ -265,35 +299,82 @@ def remove_artifacts(
             trig = artifact_per_group
         else:
             trig = artifact_per_group.get(int(gid), [])
-        if trig:
-            trig = np.unique(np.asarray(trig, dtype=np.int64)).tolist()
 
-        if trig:
-            # Apply artifact removal on this group only
-            sub_clean = spre.remove_artifacts(
-                sub_rec,
-                list_triggers=trig,     # frames on the full recording timeline
-                ms_before=ms_before,
-                ms_after=ms_after,
-                mode=mode,
-            )
-            details[int(gid)] = {
-                "n_triggers": len(trig),
-                "ms_before": ms_before,
-                "ms_after": ms_after,
-                "mode": mode,
-                "channel_ids": gr_ch_ids.tolist(),
-            }
-        else:
-            # No triggers -> passthrough
+        if use_epochs and len(trig):
+            # Expect [[start, end], ...] in frames. Allow per-epoch duration via grouped passes.
+            epochs = np.asarray(trig)
+            if epochs.ndim != 2 or epochs.shape[1] != 2:
+                raise ValueError(f"Invalid epoch format for group {gid}: expected [[start, end], ...].")
+            epochs = epochs.astype(np.int64)
+            durations = epochs[:, 1] - epochs[:, 0]
+            if np.any(durations <= 0):
+                bad = epochs[durations <= 0]
+                raise ValueError(f"Non-positive epoch duration for group {gid}: {bad.tolist()}")
+
+            # Group epochs by duration (in frames) to reuse a single ms_after per pass.
+            duration_to_starts = {}
+            for (start, end), dur in zip(epochs, durations):
+                duration_to_starts.setdefault(int(dur), []).append(int(start))
+
+            # Run one pass per duration group; pad with the requested ms_before/ms_after.
             sub_clean = sub_rec
+            per_pass = []
+            for dur_frames, starts in duration_to_starts.items():
+                starts_unique = np.unique(np.asarray(starts, dtype=np.int64)).tolist()
+                duration_ms = (dur_frames / sf) * 1000.0
+                pass_ms_before = max(0.0, float(ms_before))
+                pass_ms_after = max(0.0, float(ms_after) + duration_ms)
+
+                sub_clean = spre.remove_artifacts(
+                    sub_clean,
+                    list_triggers=starts_unique,
+                    ms_before=pass_ms_before,
+                    ms_after=pass_ms_after,
+                    mode=mode,
+                )
+                per_pass.append({
+                    "duration_frames": dur_frames,
+                    "duration_ms": duration_ms,
+                    "n_triggers": len(starts_unique),
+                    "ms_before": pass_ms_before,
+                    "ms_after": pass_ms_after,
+                })
+
             details[int(gid)] = {
-                "n_triggers": 0,
-                "ms_before": ms_before,
-                "ms_after": ms_after,
-                "mode": mode,
+                "use_epochs": True,
+                "passes": per_pass,
                 "channel_ids": gr_ch_ids.tolist(),
             }
+
+        else:
+            # Standard trigger mode or empty
+            if trig:
+                trig = np.unique(np.asarray(trig, dtype=np.int64)).tolist()
+                sub_clean = spre.remove_artifacts(
+                    sub_rec,
+                    list_triggers=trig,     # frames on the full recording timeline
+                    ms_before=ms_before,
+                    ms_after=ms_after,
+                    mode=mode,
+                )
+                details[int(gid)] = {
+                    "n_triggers": len(trig),
+                    "ms_before": ms_before,
+                    "ms_after": ms_after,
+                    "mode": mode,
+                    "channel_ids": gr_ch_ids.tolist(),
+                    "use_epochs": False,
+                }
+            else:
+                sub_clean = sub_rec
+                details[int(gid)] = {
+                    "n_triggers": 0,
+                    "ms_before": ms_before if not use_epochs else 0,
+                    "ms_after": ms_after if not use_epochs else 0,
+                    "mode": mode,
+                    "channel_ids": gr_ch_ids.tolist(),
+                    "use_epochs": use_epochs,
+                }
 
         cleaned_subs.append(sub_clean)
 
@@ -327,10 +408,16 @@ def plot_traces_around_artifact(
     color_groups: bool = False,
     figsize: tuple = (12, 6),
     n_max: int | None = None,
+    plot_indices: list[int] | None = None,
 ):
     """
     Plots 'Before' and 'After' traces side-by-side for each TTL event.
     Ensures only common channels are plotted to avoid mismatches.
+
+    Parameters
+    ----------
+    plot_indices : list[int], optional
+        List of specific indices in ttl_times to plot. If provided, overrides n_max.
     """
     # 1. Basic validation
     assert recording_before.get_num_segments() > segment_index
@@ -373,8 +460,14 @@ def plot_traces_around_artifact(
     except ValueError:
         final_channel_ids = np.sort(common_ids)
 
-    # 5. Subsample TTLs if limit is set
-    if n_max is not None and len(ttl_times) > n_max:
+    # 5. Handle plot_indices or n_max
+    if plot_indices is not None:
+        # Filter indices to ensure they are within bounds
+        valid_indices = [i for i in plot_indices if 0 <= i < len(ttl_times)]
+        if len(valid_indices) < len(plot_indices):
+            print(f"Warning: {len(plot_indices) - len(valid_indices)} indices were out of bounds and ignored.")
+        ttl_times = ttl_times[valid_indices]
+    elif n_max is not None and len(ttl_times) > n_max:
         idxs = np.linspace(0, len(ttl_times) - 1, n_max, dtype=int)
         ttl_times = ttl_times[idxs]
 
